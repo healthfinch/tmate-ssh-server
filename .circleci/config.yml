@@ -2,7 +2,7 @@ version: 2
 jobs:
   build:
     docker:
-      - image: docker.io/alpine:3.9
+      - image: docker.io/healthfinch/circleci-lein:jdk10
     working_directory: ~/project
     steps:
       - run:
@@ -43,7 +43,7 @@ jobs:
             # Do not begin while another deploy of same branch is in progress.
             ./.circleci/circle-lock.sh -b $CIRCLE_BRANCH -j $CIRCLE_JOB
       - run:
-          name: Update CloudFormation stack to create new task definition and service version
+          name: Update CloudFormation stack to create new task definition
           command: |
             aws configure set region us-east-1
             if [[ "$CIRCLE_BRANCH" == "stage" ]]; then
