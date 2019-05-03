@@ -1,0 +1,84 @@
+version: 2
+jobs:
+  build:
+    docker:
+      - image: docker.io/alpine:3.9
+    working_directory: ~/project
+    steps:
+      - run:
+          name: query ECR for previous artifacts
+          command: |
+            aws configure set region us-east-1
+            aws ecr describe-images \
+              --repository-name tmate \
+              --image-ids imageTag=$CIRCLE_SHA1 >/dev/null 2>&1 \
+            && touch /tmp/skip_build || true
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: 'build and push docker images'
+          command: |
+            if [ -f /tmp/skip_build ]; then
+              echo "We've built $CIRCLE_SHA1 already, skipping docker push"
+            else
+              mkdir workspace
+              cp deploy/docker/Dockerfile workspace
+              cd workspace
+              REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com"
+              TAG_TMATE="$REGISTRY/tmate:$CIRCLE_SHA1"
+
+              # TODO: are there any labels we would want on this docker image?
+              #--label circleci.workflow_id="$CIRCLE_WORKFLOW_ID" \
+              docker build -t $TAG_TMATE .
+
+              # Retrieve and run docker login command.
+              $(aws ecr get-login --no-include-email)
+
+              docker push $TAG_TMATE
+            fi
+    deploy:
+      - run:
+          name: "Wait for other stack updates to finish"
+          command: |
+            # Do not begin while another deploy of same branch is in progress.
+            ./.circleci/circle-lock.sh -b $CIRCLE_BRANCH -j $CIRCLE_JOB
+      - run:
+          name: Update CloudFormation stack to create new task definition and service version
+          command: |
+            aws configure set region us-east-1
+            if [[ "$CIRCLE_BRANCH" == "stage" ]]; then
+              ENVIRONMENT=staging
+            elif [[ "$CIRCLE_BRANCH" == "production" ]]; then
+              ENVIRONMENT=production
+            fi
+
+            cat 'deploy/'"$CIRCLE_BRANCH"'-bpa-params.json' |
+              sed "s/CONTAINER_SHA/$CIRCLE_SHA1/g" |
+              sed "s/ENVIRONMENT/$ENVIRONMENT/g" > deploy/bpa-stack-params.json
+
+            STACK_NAME=$(cat 'deploy/'"$CIRCLE_BRANCH"'_stackname')
+
+            aws cloudformation update-stack \
+              --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+              --stack-name $STACK_NAME \
+              --template-body file://deploy/workflow-service.yaml \
+              --parameters file://deploy/bpa-stack-params.json
+
+      - run:
+          name: Block until BPA CF update complete
+          command: |
+             STACK_NAME=$(cat 'deploy/'"$CIRCLE_BRANCH"'_stackname')
+             aws cloudformation wait stack-update-complete \
+               --stack-name $STACK_NAME
+          no_output_timeout: 15m
+
+workflows:
+  version: 2
+  main:
+    jobs:
+      - build:
+      - deploy:
+        requires:
+          - build
+
+# vim: set et ts=2 sw=2 fdm=indent:

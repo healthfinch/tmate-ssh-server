@@ -1,0 +1,355 @@
+Description: Job Workflow Service
+Parameters:
+  VPCStackName:
+    Description: The name of the Stack for the VPC
+    Type: String
+
+  DesiredCount:
+    Description: How many instances of this task should we run across our cluster?
+    Type: Number
+    Default: 2
+
+  Listener:
+    Description: The Application Load Balancer listener to register with
+    Type: String
+
+  ContainerImageTag:
+    Description: The CircleCI assigned tag for the Job Workflow code container
+    Type: String
+
+  Environment:
+    Description: Name of environment this stack deploys to
+    Type: String
+
+  SharedStateEnvironment:
+    Description: The name of the folder in the shared state bucket
+    Type: String
+
+  ApplicationConfigBucket:
+    Description: S3 bucket for retrieving application config
+    Type: String
+    Default: healthfinch-running-app-files
+
+  ApplicationConfigKey:
+    Description: S3 key path (beyond bucket) for location of application config file
+    Type: String
+
+  CanonicalPatientApplicationConfigKey:
+    Description: NOT USED HERE, GETTING READY FOR STACK CONSOLIDATION
+    Type: String
+
+  CareGapsApplicationConfigKey:
+    Description: NOT USED HERE, GETTING READY FOR STACK CONSOLIDATION
+    Type: String
+
+  TaskMemory:
+    Description: Memory allocated to the task container
+    Type: Number
+
+  TaskCpu:
+    Description: Cpu allocated to the task container
+    Type: Number
+
+  DDAPIKey:
+    Description: The DataDog API Key
+    Type: String
+
+  Subnets:
+    Description: Where to drop the containers, comma-separated (ID not CIDR)
+    Type: String
+
+  StreamShardCount:
+    Description: Number of shards in the workflow event stream
+    Type: Number
+
+Resources:
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn:
+      - TargetGroup
+    Properties:
+      ListenerArn: !Ref Listener
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /*
+      Priority: 1
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "SharedNetworking-${VPCStackName}Vpc"
+      Port: 443
+      Protocol: HTTPS
+      # this setting affects the time removing containers
+      # set this to just above our max request SLA when determined
+      TargetGroupAttributes:
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "65"
+      # Changing the interval between healthchecks is a tradeoff
+      # between failure detection and container update speed
+      HealthCheckIntervalSeconds: '30'
+      HealthCheckTimeoutSeconds: '10'
+      HealthyThresholdCount: '2'
+      UnhealthyThresholdCount: '8'
+      HealthCheckPath: /status
+      HealthCheckProtocol: HTTPS
+      TargetType: ip
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - TaskDefinition
+      - TargetGroup
+    Properties:
+      Cluster:
+        Fn::ImportValue: !Sub "${Environment}ECSCluster"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 40 # accomodates slowish hipster batch startup
+      LoadBalancers:
+        - ContainerName: nginx
+          ContainerPort: 443
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref SecurityGroup
+          Subnets: !Split [",", !Ref Subnets]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - TaskRole
+    Properties:
+      ContainerDefinitions:
+        - Name: job-workflow
+          Essential: 'true'
+          Command:
+            - "-cp"
+            - "/healthfinch/workflow.jar"
+            - "clojure.main"
+            - "-m"
+            - "workflow-service.core.startup"
+          Image: !Sub 173830791429.dkr.ecr.us-east-1.amazonaws.com/bpa:${ContainerImageTag}
+          Environment:
+            - Name: EDN_CONFIG_BUCKET
+              Value: !Ref ApplicationConfigBucket
+            - Name: EDN_CONFIG_KEY
+              Value: !Ref ApplicationConfigKey
+            - Name: DDB_LOCK_TABLE
+              Value:
+                Fn::ImportValue: !Sub "${Environment}-LockTableName"
+            - Name: KINESIS_EVENT_STREAM
+              Value: !Ref WorkflowEventStream
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: !Sub ${AWS::StackName}
+          MemoryReservation: 400
+
+        - Name: nginx
+          Essential: 'true'
+          Image: 173830791429.dkr.ecr.us-east-1.amazonaws.com/nginx:1
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: !Sub ${AWS::StackName}
+          MemoryReservation: 200
+          PortMappings:
+            - ContainerPort: 443
+        - Name: dogstatsd
+          Essential: 'false'
+          Image: datadog/docker-dd-agent:12.6.5230-dogstatsd-alpine
+          Environment:
+            - Name: API_KEY
+              Value: !Ref DDAPIKey
+            - Name: DD_LOGS_STDOUT
+              Value: yes # consider removing when all is green
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: !Sub ${AWS::StackName}
+          MemoryReservation: 100
+      Cpu: !Ref TaskCpu
+      ExecutionRoleArn: arn:aws:iam::173830791429:role/ecsTaskExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      Family: job-workflow
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ['ecs-tasks.amazonaws.com']
+            Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-write-to-kinesis"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "kinesis:PutRecord"
+                  - "kinesis:PutRecords"
+                Resource:
+                  - !GetAtt WorkflowEventStream.Arn
+        - PolicyName: !Sub "${AWS::StackName}-list-bucket-contents"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - "arn:aws:s3:::healthfinch-shared-state"
+                  - !Sub "arn:aws:s3:::healthfinch-history-${Environment}"
+                  - !Sub "arn:aws:s3:::healthfinch-${Environment}-sqlite-hipster-batch"
+        - PolicyName: !Sub "${AWS::StackName}-get-s3-objects"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub "arn:aws:s3:::healthfinch-shared-state/*" # Temporarily wide open so that staging can access customer_test data
+                  - !Sub "arn:aws:s3:::healthfinch-running-app-files/bpa-workflow/${Environment}/*"
+                  - !Sub "arn:aws:s3:::healthfinch-history-${Environment}/*"
+                  - !Sub "arn:aws:s3:::healthfinch-${Environment}-sqlite-hipster-batch/*"
+        - PolicyName: !Sub "${AWS::StackName}-put-s3-objects"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub "arn:aws:s3:::healthfinch-history-${Environment}/*"
+                  - !Sub "arn:aws:s3:::healthfinch-epic-canonicalpatient-${Environment}/*"
+                  - !Sub "arn:aws:s3:::healthfinch-epic-care-gaps-${Environment}/*"
+                  - !Sub "arn:aws:s3:::healthfinch-sumo-overflow-${Environment}/*"
+        - PolicyName: !Sub "${AWS::StackName}-write-sla-to-ddb"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:BatchGetItem"
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:UpdateTimeToLive"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:DescribeTable"
+                  - "dynamodb:UpdateTable"
+                Resource:
+                  - !GetAtt SLATable.Arn
+        - PolicyName: !Sub "${AWS::StackName}-write-locking-to-ddb"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:BatchGetItem"
+                  - "dynamodb:BatchWriteItem"
+                  - "dynamodb:UpdateTimeToLive"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:UpdateItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:Query"
+                  - "dynamodb:DescribeTable"
+                  - "dynamodb:UpdateTable"
+                  - "dynamodb:DescribeTimeToLive"
+                  - "dynamodb:UpdateTimeToLive"
+                Resource:
+                  - Fn::ImportValue: !Sub "${Environment}-LockTable"
+        - PolicyName: !Sub "${AWS::StackName}-start-state-machine-executions"
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource:
+                  - !Sub "arn:aws:states:*:${AWS::AccountId}:stateMachine:*"
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Rules for calling into job service in the ${Environment} environment"
+      VpcId:
+        Fn::ImportValue: !Sub "SharedNetworking-${VPCStackName}Vpc"
+
+      SecurityGroupIngress:
+        - CidrIp:
+            Fn::ImportValue: !Sub "SharedNetworking-${VPCStackName}VpcCIDRBlock"
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: '0'
+          IpProtocol: '-1'
+          ToPort: '0'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub job-workflow-${AWS::StackName}
+
+  SLATable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "event_id"
+          AttributeType: "S"
+        - AttributeName: "event_inst"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "event_id"
+          KeyType: HASH
+        - AttributeName: "event_inst"
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      # WCU Autoscaling ?
+      #TimeToLiveSpecification:
+      #  TimeToLiveSpecification
+
+  WorkflowEventStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      RetentionPeriodHours: 24 # 24 is default
+      ShardCount: !Ref StreamShardCount # Per-shard: Max Write 1MB/s or 1000 rec/s. Max Read 2MB/s.
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: 'alias/aws/kinesis'
+
+Outputs:
+  KinesisStream:
+    Description: Name of Kinesis Stream for Reporting
+    Export:
+      Name: !Sub "${Environment}-WorkflowEventStream"
+    Value: !Ref WorkflowEventStream
+  KinesisStreamArn:
+    Description: ARN of Kinesis Stream for Reporting
+    Export:
+      Name: !Sub "${Environment}-WorkflowEventStreamArn"
+    Value: !GetAtt WorkflowEventStream.Arn
