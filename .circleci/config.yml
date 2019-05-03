@@ -77,8 +77,8 @@ workflows:
   main:
     jobs:
       - build
-      - deploy:
-          requires:
-            - build
+      # - deploy:
+          # requires:
+            # - build
 
 # vim: set et ts=2 sw=2 fdm=indent:
